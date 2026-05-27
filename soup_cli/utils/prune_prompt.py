@@ -35,6 +35,7 @@ from soup_cli.utils.paths import is_under_cwd
 _MAX_SCAN_ROWS = 100_000
 _MAX_ROW_CHARS = 1_000_000  # 1 MB / row
 _MAX_PREFIX_LEN = 100_000  # hard cap on returned prefix length
+_MAX_TOKENS_PER_ROW = 50_000  # max tokens per row when using tokenizer mode
 
 # Tunable: a frequency below this is meaningless (we want a *near-universal*
 # prefix). Operator can pick anything in [0, 1] via --min-frequency.
@@ -85,12 +86,102 @@ def validate_min_frequency(value: object) -> float:
     return f_value
 
 
+def _get_tokenizer(tokenizer_name: str):
+    """Lazy-load and return a transformers AutoTokenizer.
+
+    Import is deferred to avoid startup cost when tokenizer mode is not used.
+    """
+    from transformers import AutoTokenizer  # noqa: PLC0415
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, trust_remote_code=True)
+    except Exception as exc:
+        raise ValueError(
+            f"Failed to load tokenizer '{tokenizer_name}': {exc}"
+        ) from exc
+    if tokenizer is None:
+        raise ValueError(f"Tokenizer '{tokenizer_name}' returned None")
+    return tokenizer
+
+
+def _token_level_detect(
+    rows: Sequence[str],
+    *,
+    min_frequency: float,
+    tokenizer,
+) -> str:
+    """Token-level prefix detection via binary search over token IDs.
+
+    For each candidate template row, binary-search on the number of leading
+    tokens shared by >= need rows.  Decode the winning token span back to
+    text so the returned prefix can be used with ``str.startswith`` in the
+    second pass.
+    """
+    threshold = validate_min_frequency(min_frequency)
+    need = max(1, int(math.ceil(threshold * len(rows))))
+
+    # Tokenise every row once (capped).
+    tokenised: list[list[int]] = []
+    for idx, row in enumerate(rows):
+        try:
+            ids = tokenizer.encode(row, add_special_tokens=False)
+        except Exception as exc:
+            raise ValueError(
+                f"Tokenisation failed for rows[{idx}]: {exc}"
+            ) from exc
+        if len(ids) > _MAX_TOKENS_PER_ROW:
+            ids = ids[:_MAX_TOKENS_PER_ROW]
+        tokenised.append(ids)
+
+    if not tokenised:
+        return ""
+
+    if len(tokenised) == 1:
+        if threshold >= 1.0:
+            toks = tokenised[0][:_MAX_PREFIX_LEN]
+            return tokenizer.decode(toks, skip_special_tokens=True)
+        return ""
+
+    # Try each row as a template (up to 32).
+    sample_tokenised = tokenised[: min(32, len(tokenised))]
+    best_prefix = ""
+    for toks in sample_tokenised:
+        lo, hi = 0, min(len(toks), _MAX_PREFIX_LEN)
+        best_len = 0
+        while lo <= hi:
+            mid = (lo + hi) // 2
+            if mid == 0:
+                best_len = max(best_len, 0)
+                lo = mid + 1
+                continue
+            prefix_ids = toks[:mid]
+            count = sum(1 for t in tokenised if t[:mid] == prefix_ids)
+            if count >= need:
+                best_len = mid
+                lo = mid + 1
+            else:
+                hi = mid - 1
+        if best_len > len(best_prefix):
+            # Decode the winning token span back to text.
+            candidate = tokenizer.decode(
+                toks[:best_len], skip_special_tokens=True
+            )
+            if len(candidate) > len(best_prefix):
+                best_prefix = candidate
+    return best_prefix
+
+
 def detect_common_prefix(
     rows: Sequence[str],
     *,
     min_frequency: float,
+    tokenizer: str | None = None,
 ) -> str:
     """Return the longest prefix shared by >= min_frequency of rows.
+
+    When *tokenizer* is ``None`` the algorithm works at the character level.
+    Otherwise it performs binary-search over token IDs and decodes the
+    winning span back to text.
 
     Empty / single-row / no-overlap fall through to "" except the trivial
     single-row case at ``min_frequency=1.0`` where the entire row IS the
@@ -121,6 +212,12 @@ def detect_common_prefix(
 
     if not materialised:
         return ""
+
+    if tokenizer is not None:
+        tok = _get_tokenizer(tokenizer)
+        return _token_level_detect(
+            materialised, min_frequency=threshold, tokenizer=tok
+        )
 
     if len(materialised) == 1:
         # Single-row sentinel — only the trivial 100% case yields a prefix.
@@ -168,6 +265,7 @@ def prune_traces(
     *,
     output_path: str,
     min_frequency: float = _DEFAULT_MIN_FREQUENCY,
+    tokenizer: str | None = None,
 ) -> PrunePromptReport:
     """Read a JSONL of {prompt, output} rows, strip shared prefix, write.
 
@@ -233,7 +331,9 @@ def prune_traces(
             min_frequency=threshold,
         )
 
-    prefix = detect_common_prefix(prompts, min_frequency=threshold)
+    prefix = detect_common_prefix(
+        prompts, min_frequency=threshold, tokenizer=tokenizer
+    )
 
     # Second pass: write output with prefix stripped where applicable.
     rows_pruned = 0

@@ -35,6 +35,12 @@ def prune_prompt_cmd(
         "--min-frequency",
         help="Prefix must appear in >= this fraction of rows to be stripped (0.0 - 1.0).",
     ),
+    tokenizer: str | None = typer.Option(
+        None,
+        "--tokenizer",
+        "-t",
+        help="Tokenizer name/path for token-level prefix detection (e.g. 'meta-llama/Llama-3.1-8B-Instruct').",
+    ),
 ) -> None:
     """Detect + strip a shared system-prompt prefix (v0.63.0 Part B)."""
     try:
@@ -48,6 +54,7 @@ def prune_prompt_cmd(
             input_path,
             output_path=output_path,
             min_frequency=min_frequency,
+            tokenizer=tokenizer,
         )
     except FileNotFoundError:
         console.print(f"[red]Input not found: {escape(input_path)}[/]")
